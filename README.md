@@ -109,10 +109,46 @@ python buddy_lapse.py E:\DCIM -o out --codec h264_amf
 python buddy_lapse.py E:\DCIM -o out --codec h264_videotoolbox
 ```
 
-`--crf` applies only to `libx264` / `libx265`. Hardware encoders ignore it —
-use that codec's own quality flags if you need to tune further (for example
-ffmpeg `-cq` with nvenc). Prefer copying photos off the SD card before using
-`--jobs` greater than 1.
+`--crf` applies only to `libx264` / `libx265`. Hardware encoders ignore it, so
+use `--cq` for those — it becomes `-cq` for nvenc, `-global_quality` for qsv,
+`-qp_i`/`-qp_p` for amf, and `-q:v` for videotoolbox. Without `--cq` a hardware
+encoder falls back to its own default bitrate, which is usually low, so you get
+a small file at a quality you didn't choose. Prefer copying photos off the SD
+card before using `--jobs` greater than 1.
+
+## Smaller files, shorter waits
+
+A long print at one photo every 10 seconds produces a *lot* of photos, and every
+photo is one frame. 113,000 photos is a 79-minute video at 24 fps, which is both
+enormous and longer than anyone will watch.
+
+Encoder settings can't fix that — frame count is the dominant term in both file
+size and encode time. `--every-nth` and `--target-seconds` cut it directly:
+
+```
+# Use every 10th photo: a tenth the length, roughly a tenth the size
+python buddy_lapse.py C:\photos -o out --every-nth 10
+
+# Or say how long you want each video and let it pick the stride
+python buddy_lapse.py C:\photos -o out --target-seconds 60
+```
+
+Thinning happens *after* session splitting, so dropping frames never affects
+where videos get divided. The first and last photo of each session are always
+kept, so the finished print still ends the video.
+
+Measured on 6,571 real 1080p photos (one print, RTX 3080 Ti, 20-core CPU):
+
+| Settings | Time | Size |
+|---|---|---|
+| default (`libx264`, crf 18, medium) | 88.5s | 415.3 MB |
+| `--preset veryfast --crf 26` | 37.3s | 120.2 MB |
+| `--codec h264_nvenc --preset p5 --cq 26` | 30.8s | 200.0 MB |
+| `--target-seconds 60` + nvenc cq 26 | 7.2s | 43.8 MB |
+| `--every-nth 10` + nvenc cq 26 | 4.0s | 22.8 MB |
+
+Raising `--fps` shortens the video but does **not** shrink it — same frames,
+same quality, fewer seconds. Use `--every-nth` or `--target-seconds` to shrink.
 
 ## Options
 
@@ -123,7 +159,9 @@ ffmpeg `-cq` with nvenc). Prefer copying photos off the SD card before using
 | `--gap-seconds` | (auto) | Fixed session-split threshold, in seconds |
 | `--gap-multiplier` | 6 | Auto threshold = median interval x this |
 | `--min-gap-floor` | 10 | Minimum split threshold regardless of interval |
-| `--min-frames` | 3 | Skip sessions with fewer photos than this |
+| `--min-frames` | 3 | Skip sessions with fewer photos than this (counted after thinning) |
+| `--every-nth N` | off | Use only every Nth photo — biggest lever on size and time |
+| `--target-seconds S` | off | Thin each session so its video runs about S seconds |
 | `--ext` | jpg,jpeg,png,bmp,tif,tiff | File extensions to include |
 | `--no-recursive` | off | Don't scan subfolders |
 | `--workers` | auto | Parallel workers for reading timestamps |
@@ -132,6 +170,7 @@ ffmpeg `-cq` with nvenc). Prefer copying photos off the SD card before using
 | `--no-cache` | off | Disable the timestamp cache |
 | `--codec` | libx264 | ffmpeg video codec (also: h264_nvenc, h264_qsv, h264_amf, h264_videotoolbox) |
 | `--crf` | 18 | ffmpeg quality for libx264/libx265 (lower = better/larger) |
+| `--cq` | off | Constant quality for hardware codecs (try 23–28); required for real control |
 | `--preset` | medium (software) | ffmpeg `-preset` (e.g. `veryfast`, nvenc `p4`) |
 | `--threads` | 0 | ffmpeg `-threads` (0 = auto) |
 | `--overwrite` | off | Overwrite existing output files |
@@ -155,6 +194,12 @@ Run `python buddy_lapse.py --help` for the full list.
 - **Slow encodes from an SD card** — copy photos to a local SSD first, then
   use `--jobs 2` (or a hardware `--codec`). Keep `--jobs 1` when reading
   directly from the card.
+- **The video is enormous and takes forever** — you almost certainly have more
+  frames than you want. Check the "min video" figure in the `--dry-run` session
+  list, then use `--every-nth` or `--target-seconds`. See
+  [Smaller files, shorter waits](#smaller-files-shorter-waits).
+- **Hardware encode looks bad** — pass `--cq` (try 23–28). Without it the
+  encoder picks its own, usually low, default bitrate.
 
 ## Contributing
 

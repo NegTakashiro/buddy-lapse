@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import shutil
 import statistics
@@ -68,6 +69,28 @@ class Session:
 
 def default_workers() -> int:
     return min(32, (os.cpu_count() or 4) + 4)
+
+
+def stride_for_target(n_frames: int, fps: float, target_seconds: float) -> int:
+    """Frames to skip so n_frames plays for about target_seconds at fps."""
+    wanted = max(1, round(target_seconds * fps))
+    if n_frames <= wanted:
+        return 1
+    return math.ceil(n_frames / wanted)
+
+
+def decimate(frames: list[Frame], stride: int) -> list[Frame]:
+    """Keep every `stride`-th frame, always including the first and last.
+
+    The last photo is the finished print, so it's worth keeping even when the
+    stride would step past it.
+    """
+    if stride <= 1 or len(frames) <= 2:
+        return frames
+    kept = frames[::stride]
+    if kept[-1] is not frames[-1]:
+        kept.append(frames[-1])
+    return kept
 
 
 def discover_images(input_dir: Path, extensions: list[str], recursive: bool) -> list[Path]:
@@ -282,12 +305,31 @@ def write_concat_file(session: Session, fps: float, list_path: Path) -> None:
         f.write(f"file '{last_escaped}'\n")
 
 
+def quality_args(codec: str, cq: int) -> list[str]:
+    """Map --cq onto whichever constant-quality flag `codec` actually takes.
+
+    Hardware encoders each spell this differently, and ignore -crf entirely.
+    Only the nvenc spelling is verified here; the others follow ffmpeg's docs.
+    """
+    if "nvenc" in codec:
+        return ["-cq", str(cq)]
+    if "qsv" in codec:
+        return ["-global_quality", str(cq)]
+    if "amf" in codec:
+        return ["-rc", "cqp", "-qp_i", str(cq), "-qp_p", str(cq)]
+    if "videotoolbox" in codec:
+        return ["-q:v", str(cq)]
+    # Unknown encoder: -q:v is the most widely understood generic spelling.
+    return ["-q:v", str(cq)]
+
+
 def run_ffmpeg(
     list_path: Path,
     output_path: Path,
     fps: float,
     codec: str,
     crf: int,
+    cq: int | None,
     preset: str | None,
     threads: int,
     ffmpeg_bin: str,
@@ -311,9 +353,12 @@ def run_ffmpeg(
     ]
     if codec in _SOFTWARE_CODECS:
         cmd.extend(["-preset", preset or "medium", "-crf", str(crf)])
-    elif preset:
-        # Hardware encoders use different preset names (e.g. nvenc p1–p7).
-        cmd.extend(["-preset", preset])
+    else:
+        if preset:
+            # Hardware encoders use different preset names (e.g. nvenc p1–p7).
+            cmd.extend(["-preset", preset])
+        if cq is not None:
+            cmd.extend(quality_args(codec, cq))
     cmd.append(str(output_path))
 
     try:
@@ -356,6 +401,7 @@ def encode_session(
     fps: float,
     codec: str,
     crf: int,
+    cq: int | None,
     preset: str | None,
     threads: int,
     ffmpeg_bin: str,
@@ -376,7 +422,7 @@ def encode_session(
     write_concat_file(session, fps, list_path)
     try:
         ok, msg = run_ffmpeg(
-            list_path, output_path, fps, codec, crf, preset, threads,
+            list_path, output_path, fps, codec, crf, cq, preset, threads,
             ffmpeg_bin, overwrite,
         )
     finally:
@@ -406,7 +452,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                     help="Minimum split threshold in seconds regardless of detected "
                     "interval, to avoid over-splitting bursts (default: 10).")
     p.add_argument("--min-frames", type=int, default=3,
-                    help="Skip sessions with fewer than this many frames (default: 3).")
+                    help="Skip sessions with fewer than this many frames (default: 3). "
+                    "Counted after --every-nth / --target-seconds thinning.")
+
+    thin = p.add_mutually_exclusive_group()
+    thin.add_argument("--every-nth", type=int, default=None, metavar="N",
+                    help="Use only every Nth photo. The single biggest lever on both "
+                    "file size and encode time: --every-nth 10 gives a video a tenth "
+                    "as long for roughly a tenth the size.")
+    thin.add_argument("--target-seconds", type=float, default=None, metavar="SECONDS",
+                    help="Thin each session automatically so its video runs about this "
+                    "long at --fps. Sessions already shorter are left alone.")
 
     p.add_argument("--ext", type=str, default=",".join(DEFAULT_EXTENSIONS),
                     help=f"Comma-separated file extensions to include (default: {','.join(DEFAULT_EXTENSIONS)}).")
@@ -429,7 +485,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                     "h264_videotoolbox.")
     p.add_argument("--crf", type=int, default=18,
                     help="ffmpeg quality for libx264/libx265 (lower = better, default: 18). "
-                    "Ignored for hardware codecs.")
+                    "Ignored for hardware codecs; use --cq for those.")
+    p.add_argument("--cq", type=int, default=None,
+                    help="Constant-quality level for hardware codecs (lower = better; "
+                    "try 23-28). Becomes -cq for nvenc, -global_quality for qsv, "
+                    "-qp_i/-qp_p for amf, -q:v for videotoolbox. Without it the "
+                    "encoder falls back to its own default bitrate.")
     p.add_argument("--preset", type=str, default=None,
                     help="ffmpeg -preset (default: medium for libx264/libx265). "
                     "For speed try veryfast; for h264_nvenc try p4.")
@@ -464,6 +525,22 @@ def main(argv: list[str] | None = None) -> int:
     if args.jobs < 1:
         print("error: --jobs must be >= 1", file=sys.stderr)
         return 1
+    if args.every_nth is not None and args.every_nth < 1:
+        print("error: --every-nth must be >= 1", file=sys.stderr)
+        return 1
+    if args.target_seconds is not None and args.target_seconds <= 0:
+        print("error: --target-seconds must be > 0", file=sys.stderr)
+        return 1
+
+    software = args.codec in _SOFTWARE_CODECS
+    if args.cq is not None and software:
+        print(f"error: --cq applies to hardware codecs; {args.codec} uses --crf",
+              file=sys.stderr)
+        return 1
+    if args.cq is None and not software and not args.dry_run:
+        print(f"warning: {args.codec} ignores --crf and no --cq was given, so quality is "
+              "whatever the encoder defaults to (often a low fixed bitrate). "
+              "Pass --cq 23-28 to control it.", file=sys.stderr)
 
     # Check for ffmpeg up front so a missing binary fails in a second, rather
     # than after a full scan of the card. A dry run never encodes, so skip it.
@@ -524,14 +601,33 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\nMedian interval between photos: {median_interval:.2f}s")
     print(f"Session-split threshold: {threshold:.2f}s "
           f"({'fixed' if args.gap_seconds is not None else f'auto = median x {args.gap_multiplier}'})")
+
+    # Thin after splitting, never before: the gap detection above needs every
+    # timestamp to find the real breaks between prints.
+    if args.every_nth is not None or args.target_seconds is not None:
+        before = sum(s.n for s in sessions)
+        thinned = []
+        for s in sessions:
+            stride = (args.every_nth if args.every_nth is not None
+                      else stride_for_target(s.n, args.fps, args.target_seconds))
+            thinned.append(Session(frames=decimate(s.frames, stride)))
+        sessions = thinned
+        after = sum(s.n for s in sessions)
+        how = (f"1 in every {args.every_nth} photo(s)" if args.every_nth is not None
+               else f"~{args.target_seconds:g}s per video at {args.fps:g} fps")
+        print(f"Thinning: {how} -> {after:,} of {before:,} frames "
+              f"({after / before:.1%})")
+
     print(f"Detected {len(sessions)} session(s):\n")
 
     kept_sessions = []
     for i, s in enumerate(sessions, start=1):
         skip = s.n < args.min_frames
         status = "SKIP (too few frames)" if skip else "ok"
+        video_len = s.n / args.fps
         print(f"  [{i}] {s.start} -> {s.end}  "
-              f"({s.n} frames, {s.duration_seconds:.0f}s span)  {status}")
+              f"({s.n:,} frames, {s.duration_seconds:.0f}s span"
+              f" -> {video_len / 60:.1f} min video)  {status}")
         if not skip:
             kept_sessions.append(s)
 
@@ -582,6 +678,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.fps,
                 args.codec,
                 args.crf,
+                args.cq,
                 args.preset,
                 args.threads,
                 args.ffmpeg,

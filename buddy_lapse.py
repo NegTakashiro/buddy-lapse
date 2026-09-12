@@ -17,6 +17,7 @@ import json
 import statistics
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -326,7 +327,6 @@ def main(argv: list[str] | None = None) -> int:
         if args.keep_lists:
             list_path = lists_dir / f"{name}.txt"
         else:
-            import tempfile
             list_path = Path(tempfile.mktemp(suffix=".txt"))
 
         write_concat_file(session, args.fps, list_path)

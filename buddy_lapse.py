@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import statistics
 import subprocess
 import sys
@@ -315,10 +316,26 @@ def run_ffmpeg(
         cmd.extend(["-preset", preset])
     cmd.append(str(output_path))
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+    except FileNotFoundError:
+        return False, f"ffmpeg not found: {ffmpeg_bin}"
+    except OSError as exc:
+        # Don't let one session's launch failure take down the whole batch.
+        return False, f"could not run ffmpeg ({ffmpeg_bin}): {exc}"
     if result.returncode != 0:
         return False, result.stderr[-2000:]
     return True, "ok"
+
+
+def resolve_ffmpeg(ffmpeg_bin: str) -> str | None:
+    """Return the resolved path to the ffmpeg binary, or None if it isn't there."""
+    found = shutil.which(ffmpeg_bin)
+    if found:
+        return found
+    # shutil.which misses an explicit path to an extensionless executable.
+    p = Path(ffmpeg_bin)
+    return str(p) if p.is_file() else None
 
 
 def format_name(template: str, session: Session, index: int) -> str:
@@ -446,6 +463,19 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     if args.jobs < 1:
         print("error: --jobs must be >= 1", file=sys.stderr)
+        return 1
+
+    # Check for ffmpeg up front so a missing binary fails in a second, rather
+    # than after a full scan of the card. A dry run never encodes, so skip it.
+    if not args.dry_run and resolve_ffmpeg(args.ffmpeg) is None:
+        print(f"error: ffmpeg not found: {args.ffmpeg}\n"
+              "  Install it and make sure it's on PATH, or point --ffmpeg at the binary.\n"
+              "  Windows: winget install ffmpeg   (then restart your terminal)\n"
+              "  macOS:   brew install ffmpeg\n"
+              "  Linux:   sudo apt install ffmpeg\n"
+              "  Already installed? Your terminal may still have the old PATH.\n"
+              "  --dry-run checks photo grouping without needing ffmpeg.",
+              file=sys.stderr)
         return 1
 
     if Image is None:

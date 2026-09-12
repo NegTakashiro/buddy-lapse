@@ -14,10 +14,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import statistics
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -29,6 +31,8 @@ except ImportError:
     ExifTags = None
 
 DEFAULT_EXTENSIONS = ["jpg", "jpeg", "png", "bmp", "tif", "tiff"]
+CACHE_FILENAME = ".buddy-lapse-cache.json"
+_SOFTWARE_CODECS = frozenset({"libx264", "libx265"})
 
 # EXIF tag ids for date fields, in priority order.
 _EXIF_DATE_TAGS = (36867, 36868, 306)  # DateTimeOriginal, DateTimeDigitized, DateTime
@@ -61,13 +65,22 @@ class Session:
         return (self.end - self.start).total_seconds()
 
 
+def default_workers() -> int:
+    return min(32, (os.cpu_count() or 4) + 4)
+
+
 def discover_images(input_dir: Path, extensions: list[str], recursive: bool) -> list[Path]:
     exts = {e.lower().lstrip(".") for e in extensions}
-    pattern = "**/*" if recursive else "*"
-    files = []
-    for p in input_dir.glob(pattern):
-        if p.is_file() and p.suffix.lower().lstrip(".") in exts:
-            files.append(p)
+    files: list[Path] = []
+    seen: set[Path] = set()
+    # Glob both lower and upper so .JPG matches on case-sensitive filesystems.
+    patterns_exts = {e for ext in exts for e in {ext, ext.upper()}}
+    for ext in patterns_exts:
+        pattern = f"**/*.{ext}" if recursive else f"*.{ext}"
+        for p in input_dir.glob(pattern):
+            if p.is_file() and p not in seen:
+                seen.add(p)
+                files.append(p)
     return files
 
 
@@ -98,6 +111,99 @@ def get_timestamp(path: Path) -> tuple[datetime, str]:
     if exif_ts is not None:
         return exif_ts, "exif"
     return datetime.fromtimestamp(path.stat().st_mtime), "mtime"
+
+
+def load_timestamp_cache(cache_path: Path) -> dict:
+    if not cache_path.is_file():
+        return {}
+    try:
+        data = json.loads(cache_path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError, ValueError):
+        return {}
+
+
+def save_timestamp_cache(cache_path: Path, cache: dict) -> None:
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(json.dumps(cache, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _cache_lookup(
+    path: Path,
+    cache: dict,
+) -> tuple[datetime, str] | None:
+    key = str(path.resolve())
+    entry = cache.get(key)
+    if not isinstance(entry, dict):
+        return None
+    try:
+        st = path.stat()
+        if entry.get("mtime_ns") != st.st_mtime_ns or entry.get("size") != st.st_size:
+            return None
+        ts = datetime.fromisoformat(entry["ts_iso"])
+        source = entry.get("source", "mtime")
+        if source not in ("exif", "mtime"):
+            return None
+        return ts, source
+    except (OSError, KeyError, TypeError, ValueError):
+        return None
+
+
+def _cache_store(path: Path, ts: datetime, source: str, cache: dict) -> None:
+    try:
+        st = path.stat()
+        cache[str(path.resolve())] = {
+            "mtime_ns": st.st_mtime_ns,
+            "size": st.st_size,
+            "ts_iso": ts.isoformat(sep=" "),
+            "source": source,
+        }
+    except OSError:
+        pass
+
+
+def collect_timestamps(
+    paths: list[Path],
+    workers: int,
+    cache: dict | None,
+) -> tuple[list[Frame], int, int]:
+    """Read timestamps in parallel. Returns (frames, exif_count, cache_hits)."""
+    frames: list[Frame] = []
+    exif_count = 0
+    cache_hits = 0
+    total = len(paths)
+    progress_every = max(1, total // 20) if total else 1
+
+    def resolve_one(path: Path) -> tuple[Path, datetime, str, bool]:
+        # Cache is read-only while workers run; writes happen on the main thread after.
+        if cache is not None:
+            hit = _cache_lookup(path, cache)
+            if hit is not None:
+                ts, source = hit
+                return path, ts, source, True
+        ts, source = get_timestamp(path)
+        return path, ts, source, False
+
+    results: list[tuple[Path, datetime, str, bool]] = []
+    done = 0
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        futures = [pool.submit(resolve_one, p) for p in paths]
+        for fut in as_completed(futures):
+            results.append(fut.result())
+            done += 1
+            if done == total or done % progress_every == 0:
+                print(f"  ... {done}/{total} timestamps", flush=True)
+
+    for path, ts, source, from_cache in results:
+        if from_cache:
+            cache_hits += 1
+        elif cache is not None:
+            _cache_store(path, ts, source, cache)
+        if source == "exif":
+            exif_count += 1
+        frames.append(Frame(path=path, ts=ts))
+
+    return frames, exif_count, cache_hits
 
 
 def build_sessions(
@@ -144,15 +250,16 @@ def escape_concat_path(path: Path) -> str:
 
 
 def write_concat_file(session: Session, fps: float, list_path: Path) -> None:
-    frame_duration = 1.0 / fps
-    lines = []
-    for frame in session.frames:
-        lines.append(f"file '{escape_concat_path(frame.path)}'")
-        lines.append(f"duration {frame_duration:.6f}")
-    # ffmpeg's concat demuxer ignores the duration on the final entry, so the
-    # last file must be repeated without a duration line to display fully.
-    lines.append(f"file '{escape_concat_path(session.frames[-1].path)}'")
-    list_path.write_text("\n".join(lines), encoding="utf-8")
+    duration_line = f"duration {1.0 / fps:.6f}"
+    with list_path.open("w", encoding="utf-8", newline="\n") as f:
+        last_escaped = ""
+        for frame in session.frames:
+            last_escaped = escape_concat_path(frame.path)
+            f.write(f"file '{last_escaped}'\n")
+            f.write(f"{duration_line}\n")
+        # ffmpeg's concat demuxer ignores the duration on the final entry, so the
+        # last file must be repeated without a duration line to display fully.
+        f.write(f"file '{last_escaped}'\n")
 
 
 def run_ffmpeg(
@@ -161,6 +268,8 @@ def run_ffmpeg(
     fps: float,
     codec: str,
     crf: int,
+    preset: str | None,
+    threads: int,
     ffmpeg_bin: str,
     overwrite: bool,
 ) -> tuple[bool, str]:
@@ -178,9 +287,15 @@ def run_ffmpeg(
         "-pix_fmt", "yuv420p",
         "-r", str(fps),
         "-c:v", codec,
-        "-crf", str(crf),
-        str(output_path),
+        "-threads", str(threads),
     ]
+    if codec in _SOFTWARE_CODECS:
+        cmd.extend(["-preset", preset or "medium", "-crf", str(crf)])
+    elif preset:
+        # Hardware encoders use different preset names (e.g. nvenc p1–p7).
+        cmd.extend(["-preset", preset])
+    cmd.append(str(output_path))
+
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         return False, result.stderr[-2000:]
@@ -194,6 +309,46 @@ def format_name(template: str, session: Session, index: int) -> str:
         n=session.n,
         index=index,
     )
+
+
+def encode_session(
+    index: int,
+    session: Session,
+    total: int,
+    name_template: str,
+    output_dir: Path,
+    lists_dir: Path | None,
+    fps: float,
+    codec: str,
+    crf: int,
+    preset: str | None,
+    threads: int,
+    ffmpeg_bin: str,
+    overwrite: bool,
+) -> tuple[int, str, Path, bool, str, int]:
+    name = format_name(name_template, session, index)
+    output_path = output_dir / name
+
+    if lists_dir is not None:
+        list_path = lists_dir / f"{name}.txt"
+        keep_list = True
+    else:
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
+        tmp.close()
+        list_path = Path(tmp.name)
+        keep_list = False
+
+    write_concat_file(session, fps, list_path)
+    try:
+        ok, msg = run_ffmpeg(
+            list_path, output_path, fps, codec, crf, preset, threads,
+            ffmpeg_bin, overwrite,
+        )
+    finally:
+        if not keep_list and list_path.exists():
+            list_path.unlink()
+
+    return index, name, output_path, ok, msg, session.n
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -222,8 +377,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                     help=f"Comma-separated file extensions to include (default: {','.join(DEFAULT_EXTENSIONS)}).")
     p.add_argument("--no-recursive", action="store_true", help="Don't scan subfolders.")
 
-    p.add_argument("--codec", type=str, default="libx264", help="ffmpeg video codec (default: libx264).")
-    p.add_argument("--crf", type=int, default=18, help="ffmpeg quality (lower = better, default: 18).")
+    p.add_argument("--workers", type=int, default=None,
+                    help="Parallel workers for reading timestamps "
+                    f"(default: {default_workers()}).")
+    p.add_argument("--jobs", type=int, default=1,
+                    help="Number of concurrent ffmpeg encodes (default: 1). "
+                    "Use 2+ when photos are on a fast local disk.")
+    p.add_argument("--cache", type=Path, default=None,
+                    help="Timestamp cache file (default: <output>/.buddy-lapse-cache.json).")
+    p.add_argument("--no-cache", action="store_true",
+                    help="Disable the timestamp cache.")
+
+    p.add_argument("--codec", type=str, default="libx264",
+                    help="ffmpeg video codec (default: libx264). "
+                    "Hardware options include h264_nvenc, h264_qsv, h264_amf, "
+                    "h264_videotoolbox.")
+    p.add_argument("--crf", type=int, default=18,
+                    help="ffmpeg quality for libx264/libx265 (lower = better, default: 18). "
+                    "Ignored for hardware codecs.")
+    p.add_argument("--preset", type=str, default=None,
+                    help="ffmpeg -preset (default: medium for libx264/libx265). "
+                    "For speed try veryfast; for h264_nvenc try p4.")
+    p.add_argument("--threads", type=int, default=0,
+                    help="ffmpeg -threads (default: 0 = auto).")
     p.add_argument("--ffmpeg", type=str, default="ffmpeg", help="Path to the ffmpeg binary.")
     p.add_argument("--overwrite", action="store_true", help="Overwrite existing output files.")
 
@@ -247,6 +423,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: input dir not found: {args.input_dir}", file=sys.stderr)
         return 1
 
+    if args.workers is not None and args.workers < 1:
+        print("error: --workers must be >= 1", file=sys.stderr)
+        return 1
+    if args.jobs < 1:
+        print("error: --jobs must be >= 1", file=sys.stderr)
+        return 1
+
     if Image is None:
         print("warning: Pillow is not installed, so EXIF timestamps can't be read. "
               "Falling back to file modification time for all photos. "
@@ -259,15 +442,21 @@ def main(argv: list[str] | None = None) -> int:
               file=sys.stderr)
         return 1
 
-    print(f"Found {len(paths)} photo(s). Reading timestamps...")
-    frames: list[Frame] = []
-    exif_count = 0
-    for path in paths:
-        ts, source = get_timestamp(path)
-        if source == "exif":
-            exif_count += 1
-        frames.append(Frame(path=path, ts=ts))
+    workers = args.workers if args.workers is not None else default_workers()
+    use_cache = not args.no_cache
+    cache_path = args.cache if args.cache is not None else (args.output / CACHE_FILENAME)
+    cache: dict | None = load_timestamp_cache(cache_path) if use_cache else None
+
+    print(f"Found {len(paths)} photo(s). Reading timestamps "
+          f"({workers} worker{'s' if workers != 1 else ''}"
+          f"{', cache on' if use_cache else ', cache off'})...")
+    frames, exif_count, cache_hits = collect_timestamps(paths, workers, cache)
     frames.sort(key=lambda f: f.ts)
+
+    if use_cache and cache is not None:
+        save_timestamp_cache(cache_path, cache)
+        print(f"  Cache: {cache_hits}/{len(frames)} hit(s); wrote {cache_path}")
+
     print(f"  {exif_count}/{len(frames)} timestamps came from EXIF; "
           f"{len(frames) - exif_count} fell back to file modification time.")
 
@@ -314,36 +503,44 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     args.output.mkdir(parents=True, exist_ok=True)
-    lists_dir = args.output / "_concat_lists"
+    lists_dir: Path | None = None
     if args.keep_lists:
+        lists_dir = args.output / "_concat_lists"
         lists_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"\nEncoding {len(kept_sessions)} video(s) to {args.output} at {args.fps} fps...\n")
+    jobs = min(args.jobs, len(kept_sessions))
+    print(f"\nEncoding {len(kept_sessions)} video(s) to {args.output} at {args.fps} fps "
+          f"({jobs} concurrent job{'s' if jobs != 1 else ''})...\n")
+
     failures = 0
-    for i, session in enumerate(kept_sessions, start=1):
-        name = format_name(args.name_template, session, i)
-        output_path = args.output / name
-
-        if args.keep_lists:
-            list_path = lists_dir / f"{name}.txt"
-        else:
-            list_path = Path(tempfile.mktemp(suffix=".txt"))
-
-        write_concat_file(session, args.fps, list_path)
-        try:
-            ok, msg = run_ffmpeg(
-                list_path, output_path, args.fps, args.codec, args.crf,
-                args.ffmpeg, args.overwrite,
+    with ThreadPoolExecutor(max_workers=jobs) as pool:
+        futures = [
+            pool.submit(
+                encode_session,
+                i,
+                session,
+                len(kept_sessions),
+                args.name_template,
+                args.output,
+                lists_dir,
+                args.fps,
+                args.codec,
+                args.crf,
+                args.preset,
+                args.threads,
+                args.ffmpeg,
+                args.overwrite,
             )
-        finally:
-            if not args.keep_lists and list_path.exists():
-                list_path.unlink()
+            for i, session in enumerate(kept_sessions, start=1)
+        ]
+        results = [fut.result() for fut in as_completed(futures)]
 
+    for index, name, output_path, ok, msg, n_frames in sorted(results, key=lambda r: r[0]):
         if ok:
-            print(f"  [{i}/{len(kept_sessions)}] wrote {output_path} ({session.n} frames)")
+            print(f"  [{index}/{len(kept_sessions)}] wrote {output_path} ({n_frames} frames)")
         else:
             failures += 1
-            print(f"  [{i}/{len(kept_sessions)}] FAILED: {name}\n    {msg}")
+            print(f"  [{index}/{len(kept_sessions)}] FAILED: {name}\n    {msg}")
 
     if failures:
         print(f"\nDone with {failures} failure(s).")

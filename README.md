@@ -22,7 +22,8 @@ you don't have to manually sort files or run ffmpeg by hand.
   output naming, and more.
 - **Safe to re-run** — `--dry-run` shows you exactly how photos would be
   grouped before any video is encoded, and existing outputs are never
-  overwritten unless you pass `--overwrite`.
+  overwritten unless you pass `--overwrite`. Timestamp caching makes repeat
+  scans much faster.
 
 ## Requirements
 
@@ -86,6 +87,31 @@ python buddy_lapse.py E:\DCIM -o out --gap-seconds 300
 python buddy_lapse.py E:\DCIM -o out --gap-multiplier 3
 ```
 
+## Faster encoding
+
+Timestamps are read in parallel by default, and a cache under the output
+folder (`.buddy-lapse-cache.json`) skips unchanged files on re-runs. For
+encode speed:
+
+```
+# Faster software encode (photos already copied to SSD)
+python buddy_lapse.py E:\DCIM -o out --preset veryfast --jobs 2
+
+# Trade a little quality for speed/size
+python buddy_lapse.py E:\DCIM -o out --preset veryfast --crf 23
+
+# Hardware encode examples (keep --jobs 1; one encode usually saturates the GPU)
+python buddy_lapse.py E:\DCIM -o out --codec h264_nvenc --preset p4
+python buddy_lapse.py E:\DCIM -o out --codec h264_qsv
+python buddy_lapse.py E:\DCIM -o out --codec h264_amf
+python buddy_lapse.py E:\DCIM -o out --codec h264_videotoolbox
+```
+
+`--crf` applies only to `libx264` / `libx265`. Hardware encoders ignore it —
+use that codec's own quality flags if you need to tune further (for example
+ffmpeg `-cq` with nvenc). Prefer copying photos off the SD card before using
+`--jobs` greater than 1.
+
 ## Options
 
 | Option | Default | Description |
@@ -98,8 +124,14 @@ python buddy_lapse.py E:\DCIM -o out --gap-multiplier 3
 | `--min-frames` | 3 | Skip sessions with fewer photos than this |
 | `--ext` | jpg,jpeg,png,bmp,tif,tiff | File extensions to include |
 | `--no-recursive` | off | Don't scan subfolders |
-| `--codec` | libx264 | ffmpeg video codec |
-| `--crf` | 18 | ffmpeg quality (lower = better/larger) |
+| `--workers` | auto | Parallel workers for reading timestamps |
+| `--jobs` | 1 | Concurrent ffmpeg encodes (use 2+ on fast local disk) |
+| `--cache PATH` | `<output>/.buddy-lapse-cache.json` | Timestamp cache file |
+| `--no-cache` | off | Disable the timestamp cache |
+| `--codec` | libx264 | ffmpeg video codec (also: h264_nvenc, h264_qsv, h264_amf, h264_videotoolbox) |
+| `--crf` | 18 | ffmpeg quality for libx264/libx265 (lower = better/larger) |
+| `--preset` | medium (software) | ffmpeg `-preset` (e.g. `veryfast`, nvenc `p4`) |
+| `--threads` | 0 | ffmpeg `-threads` (0 = auto) |
 | `--overwrite` | off | Overwrite existing output files |
 | `--name-template` | `{start}_{n}frames.mp4` | Output filename; placeholders `{start} {end} {n} {index}` |
 | `--dry-run` | off | Report sessions without encoding |
@@ -118,6 +150,9 @@ Run `python buddy_lapse.py --help` for the full list.
 - **Videos are being split too often / not often enough** — run with
   `--dry-run` first, then tune `--gap-multiplier` (or set a fixed
   `--gap-seconds`) until the sessions match your prints.
+- **Slow encodes from an SD card** — copy photos to a local SSD first, then
+  use `--jobs 2` (or a hardware `--codec`). Keep `--jobs 1` when reading
+  directly from the card.
 
 ## Contributing
 

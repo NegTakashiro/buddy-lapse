@@ -90,8 +90,10 @@ python buddy_lapse.py E:\DCIM -o out --gap-multiplier 3
 ## Faster encoding
 
 Timestamps are read in parallel by default, and a cache under the output
-folder (`.buddy-lapse-cache.json`) skips unchanged files on re-runs. For
-encode speed:
+folder (`.buddy-lapse-cache.json`) skips unchanged files on re-runs. A file is
+re-read whenever its size or modification time changes, and entries for photos
+that no longer exist are dropped. `--dry-run` updates the cache too, but never
+creates the output folder just to store it. For encode speed:
 
 ```
 # Faster software encode (photos already copied to SSD)

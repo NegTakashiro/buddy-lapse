@@ -71,16 +71,15 @@ def default_workers() -> int:
 
 def discover_images(input_dir: Path, extensions: list[str], recursive: bool) -> list[Path]:
     exts = {e.lower().lstrip(".") for e in extensions}
-    files: list[Path] = []
-    seen: set[Path] = set()
-    # Glob both lower and upper so .JPG matches on case-sensitive filesystems.
-    patterns_exts = {e for ext in exts for e in {ext, ext.upper()}}
-    for ext in patterns_exts:
-        pattern = f"**/*.{ext}" if recursive else f"*.{ext}"
-        for p in input_dir.glob(pattern):
-            if p.is_file() and p not in seen:
-                seen.add(p)
-                files.append(p)
+    # One walk, matching on the lowercased suffix, so every case variant is
+    # caught (.jpg, .JPG, .Jpg) on case-sensitive filesystems too. Sorted so
+    # that photos sharing a timestamp always land in the same frame order.
+    pattern = "**/*" if recursive else "*"
+    files = [
+        p for p in input_dir.glob(pattern)
+        if p.suffix.lower().lstrip(".") in exts and p.is_file()
+    ]
+    files.sort()
     return files
 
 
@@ -123,9 +122,18 @@ def load_timestamp_cache(cache_path: Path) -> dict:
         return {}
 
 
-def save_timestamp_cache(cache_path: Path, cache: dict) -> None:
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
+def save_timestamp_cache(cache_path: Path, cache: dict, create_dirs: bool = True) -> bool:
+    """Write the cache. Returns False if it was skipped.
+
+    With create_dirs=False the write is skipped rather than creating the parent
+    directory, which keeps --dry-run from materialising an output folder.
+    """
+    if not cache_path.parent.is_dir():
+        if not create_dirs:
+            return False
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
     cache_path.write_text(json.dumps(cache, indent=2, sort_keys=True), encoding="utf-8")
+    return True
 
 
 def _cache_lookup(
@@ -166,44 +174,55 @@ def collect_timestamps(
     paths: list[Path],
     workers: int,
     cache: dict | None,
-) -> tuple[list[Frame], int, int]:
-    """Read timestamps in parallel. Returns (frames, exif_count, cache_hits)."""
-    frames: list[Frame] = []
-    exif_count = 0
-    cache_hits = 0
-    total = len(paths)
-    progress_every = max(1, total // 20) if total else 1
+) -> tuple[list[Frame], int, int, dict]:
+    """Read timestamps in parallel.
 
-    def resolve_one(path: Path) -> tuple[Path, datetime, str, bool]:
-        # Cache is read-only while workers run; writes happen on the main thread after.
+    Returns (frames, exif_count, cache_hits, fresh_cache). Frames come back in
+    the order of `paths` rather than the order workers happen to finish, so the
+    frame order is reproducible. fresh_cache holds an entry only for the paths
+    seen this run, which drops entries for photos that no longer exist instead
+    of letting them pile up.
+    """
+    total = len(paths)
+    # Cap progress output at ~20 updates, and stay quiet on small batches where
+    # one line per photo is just noise.
+    progress_every = max(1, total // 20)
+    show_progress = total >= 200
+
+    def resolve_one(path: Path) -> tuple[datetime, str, bool]:
+        # Cache is read-only while workers run; fresh_cache is built on the
+        # main thread once they're done.
         if cache is not None:
             hit = _cache_lookup(path, cache)
             if hit is not None:
-                ts, source = hit
-                return path, ts, source, True
+                return hit[0], hit[1], True
         ts, source = get_timestamp(path)
-        return path, ts, source, False
+        return ts, source, False
 
-    results: list[tuple[Path, datetime, str, bool]] = []
+    results: list[tuple[datetime, str, bool]] = [(datetime.min, "mtime", False)] * total
     done = 0
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-        futures = [pool.submit(resolve_one, p) for p in paths]
+        futures = {pool.submit(resolve_one, p): i for i, p in enumerate(paths)}
         for fut in as_completed(futures):
-            results.append(fut.result())
+            results[futures[fut]] = fut.result()
             done += 1
-            if done == total or done % progress_every == 0:
+            if show_progress and (done == total or done % progress_every == 0):
                 print(f"  ... {done}/{total} timestamps", flush=True)
 
-    for path, ts, source, from_cache in results:
+    frames: list[Frame] = []
+    exif_count = 0
+    cache_hits = 0
+    fresh_cache: dict = {}
+    for path, (ts, source, from_cache) in zip(paths, results):
         if from_cache:
             cache_hits += 1
-        elif cache is not None:
-            _cache_store(path, ts, source, cache)
         if source == "exif":
             exif_count += 1
+        if cache is not None:
+            _cache_store(path, ts, source, fresh_cache)
         frames.append(Frame(path=path, ts=ts))
 
-    return frames, exif_count, cache_hits
+    return frames, exif_count, cache_hits, fresh_cache
 
 
 def build_sessions(
@@ -314,7 +333,6 @@ def format_name(template: str, session: Session, index: int) -> str:
 def encode_session(
     index: int,
     session: Session,
-    total: int,
     name_template: str,
     output_dir: Path,
     lists_dir: Path | None,
@@ -450,12 +468,21 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Found {len(paths)} photo(s). Reading timestamps "
           f"({workers} worker{'s' if workers != 1 else ''}"
           f"{', cache on' if use_cache else ', cache off'})...")
-    frames, exif_count, cache_hits = collect_timestamps(paths, workers, cache)
-    frames.sort(key=lambda f: f.ts)
+    frames, exif_count, cache_hits, fresh_cache = collect_timestamps(paths, workers, cache)
+    # Tie-break on path: EXIF timestamps only have second resolution, so burst
+    # shots share one, and sorting on ts alone would leave their order up to
+    # directory iteration.
+    frames.sort(key=lambda f: (f.ts, f.path))
 
     if use_cache and cache is not None:
-        save_timestamp_cache(cache_path, cache)
-        print(f"  Cache: {cache_hits}/{len(frames)} hit(s); wrote {cache_path}")
+        # A dry run must not create the output directory, so skip the write if
+        # the cache's folder isn't there yet.
+        wrote = save_timestamp_cache(cache_path, fresh_cache, create_dirs=not args.dry_run)
+        if wrote:
+            print(f"  Cache: {cache_hits}/{len(frames)} hit(s); wrote {cache_path}")
+        else:
+            print(f"  Cache: {cache_hits}/{len(frames)} hit(s); not written "
+                  f"(dry run, and {cache_path.parent} doesn't exist yet)")
 
     print(f"  {exif_count}/{len(frames)} timestamps came from EXIF; "
           f"{len(frames) - exif_count} fell back to file modification time.")
@@ -519,7 +546,6 @@ def main(argv: list[str] | None = None) -> int:
                 encode_session,
                 i,
                 session,
-                len(kept_sessions),
                 args.name_template,
                 args.output,
                 lists_dir,
@@ -533,14 +559,17 @@ def main(argv: list[str] | None = None) -> int:
             )
             for i, session in enumerate(kept_sessions, start=1)
         ]
-        results = [fut.result() for fut in as_completed(futures)]
-
-    for index, name, output_path, ok, msg, n_frames in sorted(results, key=lambda r: r[0]):
-        if ok:
-            print(f"  [{index}/{len(kept_sessions)}] wrote {output_path} ({n_frames} frames)")
-        else:
-            failures += 1
-            print(f"  [{index}/{len(kept_sessions)}] FAILED: {name}\n    {msg}")
+        # Report each session as it finishes rather than after the whole batch,
+        # so a long encode isn't silent. With --jobs 2+ these arrive out of
+        # order; the [index] matches the session list printed above.
+        for fut in as_completed(futures):
+            index, name, output_path, ok, msg, n_frames = fut.result()
+            if ok:
+                print(f"  [{index}/{len(kept_sessions)}] wrote {output_path} "
+                      f"({n_frames} frames)", flush=True)
+            else:
+                failures += 1
+                print(f"  [{index}/{len(kept_sessions)}] FAILED: {name}\n    {msg}", flush=True)
 
     if failures:
         print(f"\nDone with {failures} failure(s).")

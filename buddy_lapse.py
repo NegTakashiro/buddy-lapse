@@ -21,10 +21,14 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import threading
+import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
 
 try:
     from PIL import Image, ExifTags
@@ -44,6 +48,7 @@ _EXIF_DATE_TAGS = (36867, 36868, 306)  # DateTimeOriginal, DateTimeDigitized, Da
 class Frame:
     path: Path
     ts: datetime
+    size: int = 0  # JPEG byte size, used as the activity signal
 
 
 @dataclass
@@ -69,6 +74,111 @@ class Session:
 
 def default_workers() -> int:
     return min(32, (os.cpu_count() or 4) + 4)
+
+
+def activity_signal(frames: list[Frame], window: int) -> list[float]:
+    """Per-frame activity score from how much the JPEG byte size moves.
+
+    A printer laying down plastic changes the scene every frame, so the
+    compressed size jitters; a finished or empty bed compresses to nearly the
+    same size every time. Measured on a real 145k-frame capture, printing runs
+    ~0.01-0.05 and idle sits near 0.0007 — a margin wide enough that no image
+    decoding is needed, and the sizes are already known from the stat() the
+    timestamp cache does anyway.
+
+    Dividing by the local size makes the score independent of resolution and
+    JPEG quality. The rolling mean over `window` frames keeps a single passing
+    shadow from reading as activity.
+    """
+    raw = [0.0]
+    for i in range(1, len(frames)):
+        a, b = frames[i - 1].size, frames[i].size
+        denom = (a + b) / 2 or 1
+        raw.append(abs(b - a) / denom)
+
+    if window <= 1:
+        return raw
+    out: list[float] = []
+    acc = 0.0
+    q: deque[float] = deque()
+    for v in raw:
+        q.append(v)
+        acc += v
+        if len(q) > window:
+            acc -= q.popleft()
+        out.append(acc / len(q))
+    return out
+
+
+def find_active_spans(
+    frames: list[Frame],
+    signal: list[float],
+    enter: float,
+    leave: float,
+    min_active_seconds: float,
+    min_idle_seconds: float,
+) -> list[tuple[int, int]]:
+    """Index spans where a print looks active, as [start, end] inclusive.
+
+    Uses two thresholds rather than one: a run has to clear `enter` to start
+    but only fall below `leave` to end, so a signal hovering at the boundary
+    doesn't chop one print into dozens of videos.
+    """
+    active = []
+    on = False
+    for v in signal:
+        if not on and v >= enter:
+            on = True
+        elif on and v < leave:
+            on = False
+        active.append(on)
+
+    spans: list[tuple[int, int]] = []
+    start = None
+    for i, a in enumerate(active):
+        if a and start is None:
+            start = i
+        elif not a and start is not None:
+            spans.append((start, i - 1))
+            start = None
+    if start is not None:
+        spans.append((start, len(active) - 1))
+
+    # A pause for a layer change or a filament swap shouldn't end the video.
+    merged: list[tuple[int, int]] = []
+    for span in spans:
+        if merged:
+            gap = (frames[span[0]].ts - frames[merged[-1][1]].ts).total_seconds()
+            if gap <= min_idle_seconds:
+                merged[-1] = (merged[-1][0], span[1])
+                continue
+        merged.append(span)
+
+    # Room lights coming on briefly move the signal too; real prints run long.
+    return [
+        (a, b) for a, b in merged
+        if (frames[b].ts - frames[a].ts).total_seconds() >= min_active_seconds
+    ]
+
+
+def report_activity(frames: list[Frame], window: int) -> None:
+    """Print the activity score hour by hour, so thresholds can be eyeballed."""
+    if len(frames) < 2:
+        return
+    signal = activity_signal(frames, window)
+    buckets: dict[datetime, list[float]] = {}
+    for frame, value in zip(frames, signal):
+        hour = frame.ts.replace(minute=0, second=0, microsecond=0)
+        buckets.setdefault(hour, []).append(value)
+
+    print("\nActivity score by hour (bar = score; compare against "
+          "--activity-enter / --activity-leave):")
+    for hour in sorted(buckets):
+        values = buckets[hour]
+        mean = sum(values) / len(values)
+        bar = "#" * min(50, int(mean * 1000))
+        print(f"  {hour:%Y-%m-%d %H:%M}  {len(values):4d}f  {mean:.5f}  {bar}")
+    print()
 
 
 def stride_for_target(n_frames: int, fps: float, target_seconds: float) -> int:
@@ -163,7 +273,7 @@ def save_timestamp_cache(cache_path: Path, cache: dict, create_dirs: bool = True
 def _cache_lookup(
     path: Path,
     cache: dict,
-) -> tuple[datetime, str] | None:
+) -> tuple[datetime, str, int] | None:
     key = str(path.resolve())
     entry = cache.get(key)
     if not isinstance(entry, dict):
@@ -176,7 +286,7 @@ def _cache_lookup(
         source = entry.get("source", "mtime")
         if source not in ("exif", "mtime"):
             return None
-        return ts, source
+        return ts, source, st.st_size
     except (OSError, KeyError, TypeError, ValueError):
         return None
 
@@ -213,17 +323,21 @@ def collect_timestamps(
     progress_every = max(1, total // 20)
     show_progress = total >= 200
 
-    def resolve_one(path: Path) -> tuple[datetime, str, bool]:
+    def resolve_one(path: Path) -> tuple[datetime, str, bool, int]:
         # Cache is read-only while workers run; fresh_cache is built on the
         # main thread once they're done.
         if cache is not None:
             hit = _cache_lookup(path, cache)
             if hit is not None:
-                return hit[0], hit[1], True
+                return hit[0], hit[1], True, hit[2]
         ts, source = get_timestamp(path)
-        return ts, source, False
+        try:
+            size = path.stat().st_size
+        except OSError:
+            size = 0
+        return ts, source, False, size
 
-    results: list[tuple[datetime, str, bool]] = [(datetime.min, "mtime", False)] * total
+    results: list[tuple[datetime, str, bool, int]] = [(datetime.min, "mtime", False, 0)] * total
     done = 0
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
         futures = {pool.submit(resolve_one, p): i for i, p in enumerate(paths)}
@@ -237,14 +351,14 @@ def collect_timestamps(
     exif_count = 0
     cache_hits = 0
     fresh_cache: dict = {}
-    for path, (ts, source, from_cache) in zip(paths, results):
+    for path, (ts, source, from_cache, size) in zip(paths, results):
         if from_cache:
             cache_hits += 1
         if source == "exif":
             exif_count += 1
         if cache is not None:
             _cache_store(path, ts, source, fresh_cache)
-        frames.append(Frame(path=path, ts=ts))
+        frames.append(Frame(path=path, ts=ts, size=size))
 
     return frames, exif_count, cache_hits, fresh_cache
 
@@ -305,6 +419,73 @@ def write_concat_file(session: Session, fps: float, list_path: Path) -> None:
         f.write(f"file '{last_escaped}'\n")
 
 
+def format_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m{seconds % 60:02d}s"
+    return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
+
+
+class EncodeProgress:
+    """Live progress across however many ffmpeg jobs are running.
+
+    Encodes here run for tens of minutes, so the run has to say something
+    while it works. Rewrites one line on a terminal; on a redirected stdout it
+    falls back to an occasional full line so logs stay readable.
+    """
+
+    WIDTH = 78
+
+    def __init__(self, total_frames: int, n_sessions: int, tty: bool):
+        self.total_frames = max(1, total_frames)
+        self.n_sessions = n_sessions
+        self.tty = tty
+        self.per_session: dict[int, int] = {}
+        self.finished = 0
+        self.lock = threading.Lock()
+        self.started = time.monotonic()
+        self.last_render = 0.0
+        self.dirty = False
+
+    def update(self, index: int, frames_done: int) -> None:
+        with self.lock:
+            self.per_session[index] = frames_done
+            self._render()
+
+    def complete(self, index: int, n_frames: int) -> None:
+        with self.lock:
+            self.per_session[index] = n_frames
+            self.finished += 1
+
+    def _render(self, force: bool = False) -> None:
+        now = time.monotonic()
+        interval = 0.5 if self.tty else 20.0
+        if not force and now - self.last_render < interval:
+            return
+        self.last_render = now
+        done = sum(self.per_session.values())
+        elapsed = now - self.started
+        rate = done / elapsed if elapsed > 0 else 0.0
+        eta = (self.total_frames - done) / rate if rate > 0 else 0.0
+        line = (f"  {done:,}/{self.total_frames:,} frames "
+                f"({done / self.total_frames:.0%})  {rate:.0f} fps  "
+                f"{self.finished}/{self.n_sessions} done  ETA {format_duration(eta)}")
+        if self.tty:
+            print("\r" + line.ljust(self.WIDTH)[:self.WIDTH], end="", flush=True)
+            self.dirty = True
+        else:
+            print(line, flush=True)
+
+    def clear_line(self) -> None:
+        """Wipe the in-place line so a result can be printed under it."""
+        with self.lock:
+            if self.tty and self.dirty:
+                print("\r" + " " * self.WIDTH + "\r", end="", flush=True)
+                self.dirty = False
+
+
 def quality_args(codec: str, cq: int) -> list[str]:
     """Map --cq onto whichever constant-quality flag `codec` actually takes.
 
@@ -334,6 +515,7 @@ def run_ffmpeg(
     threads: int,
     ffmpeg_bin: str,
     overwrite: bool,
+    on_progress: "Callable[[int], None] | None" = None,
 ) -> tuple[bool, str]:
     if output_path.exists() and not overwrite:
         return False, f"skipped (already exists: {output_path})"
@@ -341,6 +523,10 @@ def run_ffmpeg(
     cmd = [
         ffmpeg_bin,
         "-y",
+        # Machine-readable progress on stdout; -nostats drops the human version
+        # that would otherwise fight with our own status line.
+        "-progress", "pipe:1",
+        "-nostats",
         "-f", "concat",
         "-safe", "0",
         "-i", str(list_path),
@@ -362,14 +548,38 @@ def run_ffmpeg(
     cmd.append(str(output_path))
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, bufsize=1)
     except FileNotFoundError:
         return False, f"ffmpeg not found: {ffmpeg_bin}"
     except OSError as exc:
         # Don't let one session's launch failure take down the whole batch.
         return False, f"could not run ffmpeg ({ffmpeg_bin}): {exc}"
-    if result.returncode != 0:
-        return False, result.stderr[-2000:]
+
+    # Drain stderr on its own thread: a long encode can emit enough warnings to
+    # fill the pipe buffer, which would deadlock us while we read stdout.
+    stderr_chunks: list[str] = []
+
+    def drain() -> None:
+        assert proc.stderr is not None
+        for line in proc.stderr:
+            stderr_chunks.append(line)
+
+    pump = threading.Thread(target=drain, daemon=True)
+    pump.start()
+
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        if on_progress is not None and line.startswith("frame="):
+            try:
+                on_progress(int(line.split("=", 1)[1]))
+            except ValueError:
+                pass
+
+    proc.wait()
+    pump.join(timeout=5)
+    if proc.returncode != 0:
+        return False, "".join(stderr_chunks)[-2000:]
     return True, "ok"
 
 
@@ -406,6 +616,7 @@ def encode_session(
     threads: int,
     ffmpeg_bin: str,
     overwrite: bool,
+    progress: "EncodeProgress | None" = None,
 ) -> tuple[int, str, Path, bool, str, int]:
     name = format_name(name_template, session, index)
     output_path = output_dir / name
@@ -424,6 +635,8 @@ def encode_session(
         ok, msg = run_ffmpeg(
             list_path, output_path, fps, codec, crf, cq, preset, threads,
             ffmpeg_bin, overwrite,
+            on_progress=(None if progress is None
+                         else lambda done: progress.update(index, done)),
         )
     finally:
         if not keep_list and list_path.exists():
@@ -454,6 +667,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--min-frames", type=int, default=3,
                     help="Skip sessions with fewer than this many frames (default: 3). "
                     "Counted after --every-nth / --target-seconds thinning.")
+
+    p.add_argument("--detect-activity", action="store_true",
+                    help="Split on when the printer is actually working instead of "
+                    "only on gaps in time. For a camera that shoots continuously, "
+                    "this is what separates prints from the idle hours between them.")
+    p.add_argument("--activity-enter", type=float, default=0.008, metavar="X",
+                    help="Activity score at which a print is considered started "
+                    "(default: 0.008). Raise if idle stretches are being kept.")
+    p.add_argument("--activity-leave", type=float, default=0.003, metavar="X",
+                    help="Score at which an in-progress print is considered finished "
+                    "(default: 0.003). Must be below --activity-enter.")
+    p.add_argument("--activity-window", type=int, default=30, metavar="N",
+                    help="Frames to average the activity score over (default: 30).")
+    p.add_argument("--min-active-seconds", type=float, default=1800.0, metavar="S",
+                    help="Discard detected prints shorter than this (default: 1800). "
+                    "Filters out room lights and someone walking past.")
+    p.add_argument("--min-idle-seconds", type=float, default=1800.0, metavar="S",
+                    help="Idle stretch that has to pass before a print counts as "
+                    "finished (default: 1800). Shorter pauses stay in one video.")
+    p.add_argument("--activity-report", action="store_true",
+                    help="Print the hourly activity score so the thresholds above can "
+                    "be tuned to your camera. Best paired with --dry-run.")
 
     thin = p.add_mutually_exclusive_group()
     thin.add_argument("--every-nth", type=int, default=None, metavar="N",
@@ -531,6 +766,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.target_seconds is not None and args.target_seconds <= 0:
         print("error: --target-seconds must be > 0", file=sys.stderr)
         return 1
+    if args.activity_leave > args.activity_enter:
+        print("error: --activity-leave must be <= --activity-enter "
+              f"(got {args.activity_leave} > {args.activity_enter})", file=sys.stderr)
+        return 1
+    if args.activity_window < 1:
+        print("error: --activity-window must be >= 1", file=sys.stderr)
+        return 1
 
     software = args.codec in _SOFTWARE_CODECS
     if args.cq is not None and software:
@@ -602,6 +844,31 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Session-split threshold: {threshold:.2f}s "
           f"({'fixed' if args.gap_seconds is not None else f'auto = median x {args.gap_multiplier}'})")
 
+    if args.activity_report:
+        report_activity(frames, args.activity_window)
+
+    if args.detect_activity:
+        # Runs inside the gap-split sessions, not instead of them: a real break
+        # in the capture is still a break, and carving each one into active
+        # spans is what separates prints on a camera that never stops.
+        before_n = sum(s.n for s in sessions)
+        carved: list[Session] = []
+        for s in sessions:
+            sig = activity_signal(s.frames, args.activity_window)
+            for a, b in find_active_spans(s.frames, sig, args.activity_enter,
+                                          args.activity_leave, args.min_active_seconds,
+                                          args.min_idle_seconds):
+                carved.append(Session(frames=s.frames[a:b + 1]))
+        after_n = sum(s.n for s in carved)
+        idle_dropped = before_n - after_n
+        print(f"Activity detection: {len(carved)} print(s) found in "
+              f"{len(sessions)} capture block(s); dropped {idle_dropped:,} idle "
+              f"frames ({idle_dropped / before_n:.1%} of the capture)")
+        if not carved:
+            print("  Nothing cleared the activity thresholds. Re-run with "
+                  "--activity-report to see the signal, then lower --activity-enter.")
+        sessions = carved
+
     # Thin after splitting, never before: the gap detection above needs every
     # timestamp to find the real breaks between prints.
     if args.every_nth is not None or args.target_seconds is not None:
@@ -662,9 +929,12 @@ def main(argv: list[str] | None = None) -> int:
         lists_dir.mkdir(parents=True, exist_ok=True)
 
     jobs = min(args.jobs, len(kept_sessions))
-    print(f"\nEncoding {len(kept_sessions)} video(s) to {args.output} at {args.fps} fps "
+    total_frames = sum(s.n for s in kept_sessions)
+    print(f"\nEncoding {len(kept_sessions)} video(s) ({total_frames:,} frames) to "
+          f"{args.output} at {args.fps} fps "
           f"({jobs} concurrent job{'s' if jobs != 1 else ''})...\n")
 
+    progress = EncodeProgress(total_frames, len(kept_sessions), sys.stdout.isatty())
     failures = 0
     with ThreadPoolExecutor(max_workers=jobs) as pool:
         futures = [
@@ -683,6 +953,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.threads,
                 args.ffmpeg,
                 args.overwrite,
+                progress,
             )
             for i, session in enumerate(kept_sessions, start=1)
         ]
@@ -691,12 +962,15 @@ def main(argv: list[str] | None = None) -> int:
         # order; the [index] matches the session list printed above.
         for fut in as_completed(futures):
             index, name, output_path, ok, msg, n_frames = fut.result()
+            progress.complete(index, n_frames)
+            progress.clear_line()
             if ok:
                 print(f"  [{index}/{len(kept_sessions)}] wrote {output_path} "
-                      f"({n_frames} frames)", flush=True)
+                      f"({n_frames:,} frames)", flush=True)
             else:
                 failures += 1
                 print(f"  [{index}/{len(kept_sessions)}] FAILED: {name}\n    {msg}", flush=True)
+    progress.clear_line()
 
     if failures:
         print(f"\nDone with {failures} failure(s).")

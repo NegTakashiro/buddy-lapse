@@ -24,6 +24,9 @@ you don't have to manually sort files or run ffmpeg by hand.
   grouped before any video is encoded, and existing outputs are never
   overwritten unless you pass `--overwrite`. Timestamp caching makes repeat
   scans much faster.
+- **Works with always-on cameras** — `--detect-activity` figures out when the
+  printer was actually printing, so a continuous capture becomes one video per
+  print instead of one enormous video of a mostly empty bed.
 
 ## Requirements
 
@@ -116,6 +119,59 @@ encoder falls back to its own default bitrate, which is usually low, so you get
 a small file at a quality you didn't choose. Prefer copying photos off the SD
 card before using `--jobs` greater than 1.
 
+## Continuous cameras: splitting on print activity
+
+By default videos are split wherever there's a large gap in time between
+photos. That works when the camera only runs during a print. If it shoots
+continuously — every 10 seconds, day and night — there are no gaps, so a
+fortnight of captures collapses into one enormous video containing mostly an
+empty bed.
+
+`--detect-activity` splits on whether the printer is actually working:
+
+```
+# See what it finds before encoding anything
+python buddy_lapse.py C:\photos -o out --detect-activity --dry-run
+
+# Then encode one video per print
+python buddy_lapse.py C:\photos -o out --detect-activity
+```
+
+It works from the JPEG byte size that's already read for the timestamp cache,
+so it costs no extra I/O and decodes no images. A printer laying down plastic
+changes the scene every frame and the compressed size jitters; a finished or
+empty bed compresses to nearly the same size every time. On a real 145,000-frame
+capture, printing scored ~0.01–0.05 and idle ~0.0007 — a margin wide enough to
+separate reliably. That run found 38 prints across 13 days and dropped 54.7% of
+the frames as idle.
+
+Detection runs *inside* the normal gap splitting rather than replacing it, so a
+genuine break in the capture is still a break.
+
+**Tuning.** The thresholds depend on your camera and lighting, so check them
+before trusting a long run:
+
+```
+python buddy_lapse.py C:\photos -o out --dry-run --activity-report
+```
+
+That prints the score hour by hour. Compare the idle rows against
+`--activity-leave` and the busy rows against `--activity-enter`, and adjust:
+
+| Flag | Default | Use when |
+|---|---|---|
+| `--activity-enter` | 0.008 | Idle stretches are being kept — raise it |
+| `--activity-leave` | 0.003 | Prints are cut short — lower it |
+| `--activity-window` | 30 | Signal is noisy — raise to average over more frames |
+| `--min-active-seconds` | 1800 | Short bogus clips appear — raise it |
+| `--min-idle-seconds` | 1800 | One print splits into several — raise it |
+
+The known failure mode is **lighting**, not motion: turning a room light on over
+an empty bed shifts every JPEG's size and briefly looks like activity. That's
+what `--min-active-seconds` is for — real prints run for hours, stray light
+doesn't. The default of 30 minutes removed every false positive in the test
+capture while costing only 0.7% of genuinely active frames.
+
 ## Smaller files, shorter waits
 
 A long print at one photo every 10 seconds produces a *lot* of photos, and every
@@ -160,6 +216,13 @@ same quality, fewer seconds. Use `--every-nth` or `--target-seconds` to shrink.
 | `--gap-multiplier` | 6 | Auto threshold = median interval x this |
 | `--min-gap-floor` | 10 | Minimum split threshold regardless of interval |
 | `--min-frames` | 3 | Skip sessions with fewer photos than this (counted after thinning) |
+| `--detect-activity` | off | Split on printer activity, not just time gaps |
+| `--activity-enter` | 0.008 | Score at which a print counts as started |
+| `--activity-leave` | 0.003 | Score at which a print counts as finished |
+| `--activity-window` | 30 | Frames to average the activity score over |
+| `--min-active-seconds` | 1800 | Discard detected prints shorter than this |
+| `--min-idle-seconds` | 1800 | Idle time before a print counts as finished |
+| `--activity-report` | off | Print the hourly activity score, for tuning |
 | `--every-nth N` | off | Use only every Nth photo — biggest lever on size and time |
 | `--target-seconds S` | off | Thin each session so its video runs about S seconds |
 | `--ext` | jpg,jpeg,png,bmp,tif,tiff | File extensions to include |
@@ -191,6 +254,12 @@ Run `python buddy_lapse.py --help` for the full list.
 - **Videos are being split too often / not often enough** — run with
   `--dry-run` first, then tune `--gap-multiplier` (or set a fixed
   `--gap-seconds`) until the sessions match your prints.
+- **One giant video full of an empty bed** — your camera runs continuously, so
+  there are no time gaps to split on. Use `--detect-activity`; see
+  [Continuous cameras](#continuous-cameras-splitting-on-print-activity).
+- **Activity detection found nothing / kept everything** — run
+  `--dry-run --activity-report` and compare the printed scores against
+  `--activity-enter` and `--activity-leave`.
 - **Slow encodes from an SD card** — copy photos to a local SSD first, then
   use `--jobs 2` (or a hardware `--codec`). Keep `--jobs 1` when reading
   directly from the card.

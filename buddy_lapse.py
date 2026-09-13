@@ -23,7 +23,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections import deque
+import zlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
@@ -48,7 +48,7 @@ _EXIF_DATE_TAGS = (36867, 36868, 306)  # DateTimeOriginal, DateTimeDigitized, Da
 class Frame:
     path: Path
     ts: datetime
-    size: int = 0  # JPEG byte size, used as the activity signal
+    key: str = ""  # timestamp-cache key (resolved path), reused by activity detection
 
 
 @dataclass
@@ -76,108 +76,313 @@ def default_workers() -> int:
     return min(32, (os.cpu_count() or 4) + 4)
 
 
-def activity_signal(frames: list[Frame], window: int) -> list[float]:
-    """Per-frame activity score from how much the JPEG byte size moves.
+# How print activity is detected
+# ------------------------------
+# Each photo is decoded by ffmpeg to a 32x18 thumbnail. For every frame we
+# count the share of pixels whose brightness moved by more than _CHANGE_SIGMA
+# deviations since the previous frame, after normalising each thumbnail's
+# brightness and contrast. A moving toolhead or a growing part moves a solid
+# chunk of pixels; an idle bed moves none, even while the room light, the sun,
+# or the camera's auto-exposure changes, because those shift the whole image
+# and normalisation cancels them.
+#
+# The camera also flips between colour and IR night mode, sometimes every few
+# frames, and the two modes render the same scene with different tones. So a
+# frame is only compared with the previous frame taken in the same mode.
+#
+# Checked against a hand-labelled 32-hour stretch of a real capture: every
+# printing sample scored >= 0.012 and every idle sample exactly 0, including
+# hours of mode flipping and moving sunlight that a JPEG byte-size signal
+# counted as printing.
 
-    A printer laying down plastic changes the scene every frame, so the
-    compressed size jitters; a finished or empty bed compresses to nearly the
-    same size every time. Measured on a real 145k-frame capture, printing runs
-    ~0.01-0.05 and idle sits near 0.0007 — a margin wide enough that no image
-    decoding is needed, and the sizes are already known from the stat() the
-    timestamp cache does anyway.
+THUMB_W, THUMB_H = 32, 18
+_THUMB_PIXELS = THUMB_W * THUMB_H
+_IR_SATURATION = 4.0      # mean chroma distance from grey below this = IR mode
+_CHANGE_SIGMA = 0.75      # a pixel counts as changed past this many deviations
+_ACTIVITY_VERSION = 1     # bump when the score definition changes; stale caches recompute
+_DECODE_CHUNK = 500       # photos per ffmpeg process
 
-    Dividing by the local size makes the score independent of resolution and
-    JPEG quality. The rolling mean over `window` frames keeps a single passing
-    shadow from reading as activity.
-    """
-    raw = [0.0]
-    for i in range(1, len(frames)):
-        a, b = frames[i - 1].size, frames[i].size
-        denom = (a + b) / 2 or 1
-        raw.append(abs(b - a) / denom)
+# Pauses inside a print (the toolhead working out of frame, a slow section)
+# look idle too. Whether a gap is a pause or a plate change is decided by how
+# different the scene is on either side of it. A short pause can tolerate a lot
+# of difference, since the toolhead simply lands somewhere else; a longer gap
+# only counts as the same print if the plate looks unchanged. Tuned on the same
+# capture: in-print pauses of up to 17 minutes changed <= 0.04, while a 13-minute
+# plate swap changed 0.28.
+_SHORT_PAUSE_SECONDS = 600
+_SHORT_PAUSE_MAX_CHANGE = 0.25
+_LONG_PAUSE_MAX_CHANGE = 0.06
 
-    if window <= 1:
-        return raw
-    out: list[float] = []
-    acc = 0.0
-    q: deque[float] = deque()
-    for v in raw:
-        q.append(v)
-        acc += v
-        if len(q) > window:
-            acc -= q.popleft()
-        out.append(acc / len(q))
+
+@dataclass
+class Thumb:
+    luma: bytes  # THUMB_W x THUMB_H greyscale
+    ir: bool
+
+
+def _run_thumbnail_ffmpeg(paths: list[Path], ffmpeg_bin: str) -> bytes | None:
+    fd, name = tempfile.mkstemp(suffix=".txt")
+    list_path = Path(name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            for p in paths:
+                f.write(f"file '{escape_concat_path(p)}'\n")
+        cmd = [
+            ffmpeg_bin, "-v", "error",
+            # Decode JPEGs at 1/8 scale straight from the DCT; other formats ignore it.
+            "-lowres", "3",
+            "-f", "concat", "-safe", "0", "-i", str(list_path),
+            # One output frame per readable input. The default timing would put a
+            # duplicate of a neighbour in place of an unreadable photo, hiding it.
+            "-fps_mode", "passthrough",
+            "-vf", f"scale={THUMB_W}:{THUMB_H}:flags=area,format=yuv444p",
+            "-f", "rawvideo", "pipe:1",
+        ]
+        return subprocess.run(cmd, capture_output=True).stdout
+    except OSError:
+        return None
+    finally:
+        list_path.unlink(missing_ok=True)
+
+
+def _decode_batch(paths: list[Path], ffmpeg_bin: str) -> list[Thumb | None]:
+    """Thumbnails for `paths` in order; None for any photo ffmpeg can't read."""
+    frame_bytes = 3 * _THUMB_PIXELS
+    raw = _run_thumbnail_ffmpeg(paths, ffmpeg_bin)
+    if raw is None or len(raw) != len(paths) * frame_bytes:
+        # A frame went missing, so the output can no longer be lined up with the
+        # input. Split and retry until the unreadable photo is isolated.
+        if len(paths) == 1:
+            return [None]
+        mid = len(paths) // 2
+        return _decode_batch(paths[:mid], ffmpeg_bin) + _decode_batch(paths[mid:], ffmpeg_bin)
+
+    thumbs: list[Thumb | None] = []
+    for i in range(len(paths)):
+        o = i * frame_bytes
+        chroma = raw[o + _THUMB_PIXELS:o + frame_bytes]
+        saturation = sum(abs(c - 128) for c in chroma) / _THUMB_PIXELS
+        thumbs.append(Thumb(luma=raw[o:o + _THUMB_PIXELS], ir=saturation < _IR_SATURATION))
+    return thumbs
+
+
+def decode_thumbnails(paths: list[Path], ffmpeg_bin: str, workers: int) -> list[Thumb | None]:
+    """Decode many photos to thumbnails, several ffmpeg processes at a time."""
+    # ffmpeg's concat demuxer decodes every entry with the first file's codec,
+    # so a PNG in a batch of JPEGs would silently drop frames. Batch by format.
+    by_format: dict[str, list[int]] = {}
+    for i, p in enumerate(paths):
+        ext = p.suffix.lower()
+        by_format.setdefault(".jpg" if ext == ".jpeg" else ext, []).append(i)
+    batches = [idxs[k:k + _DECODE_CHUNK]
+               for idxs in by_format.values()
+               for k in range(0, len(idxs), _DECODE_CHUNK)]
+
+    out: list[Thumb | None] = [None] * len(paths)
+    total, done = len(paths), 0
+    step = max(1, total // 20)
+    next_report = step
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        futures = {pool.submit(_decode_batch, [paths[i] for i in b], ffmpeg_bin): b
+                   for b in batches}
+        for fut in as_completed(futures):
+            batch = futures[fut]
+            for i, thumb in zip(batch, fut.result()):
+                out[i] = thumb
+            done += len(batch)
+            if total >= 200 and (done >= next_report or done == total):
+                print(f"  ... {done:,}/{total:,} thumbnails", flush=True)
+                next_report = (done // step + 1) * step
     return out
 
 
-def find_active_spans(
-    frames: list[Frame],
-    signal: list[float],
-    enter: float,
-    leave: float,
-    min_active_seconds: float,
-    min_idle_seconds: float,
-) -> list[tuple[int, int]]:
-    """Index spans where a print looks active, as [start, end] inclusive.
+def _normalized(luma: bytes) -> list[float]:
+    mean = sum(luma) / _THUMB_PIXELS
+    dev = sum(abs(v - mean) for v in luma) / _THUMB_PIXELS or 1.0
+    return [(v - mean) / dev for v in luma]
 
-    Uses two thresholds rather than one: a run has to clear `enter` to start
-    but only fall below `leave` to end, so a signal hovering at the boundary
-    doesn't chop one print into dozens of videos.
+
+def _changed_fraction(a: list[float], b: list[float]) -> float:
+    return sum(1 for x, y in zip(a, b) if abs(x - y) > _CHANGE_SIGMA) / _THUMB_PIXELS
+
+
+def _key_hash(key: str) -> int:
+    return zlib.crc32(key.encode("utf-8"))
+
+
+class ActivityAnalyzer:
+    """Per-frame change scores for a sorted list of frames, reusing the cache.
+
+    A frame's score depends on the frame before it in the same camera mode, so
+    a cached score is reused only while that neighbour is still the same photo.
+    Re-running over an unchanged folder decodes nothing; when new photos
+    arrive, only they and the frames they now follow get decoded.
     """
-    active = []
-    on = False
-    for v in signal:
-        if not on and v >= enter:
-            on = True
-        elif on and v < leave:
-            on = False
-        active.append(on)
 
+    def __init__(self, frames: list[Frame], cache: dict | None, ffmpeg_bin: str, workers: int):
+        self.frames = frames
+        self.ffmpeg_bin = ffmpeg_bin
+        self.workers = workers
+        self.thumbs: dict[int, Thumb] = {}
+        self.decoded = 0
+        n = len(frames)
+        self.mode: list[int | None] = [None] * n    # 1 = IR, 0 = colour, -1 = unreadable
+        self._entries = [cache.get(f.key) if cache is not None else None for f in frames]
+        self._cached_score: list[float | None] = [None] * n
+        self._cached_prev: list[int | None] = [None] * n
+        for i, entry in enumerate(self._entries):
+            act = entry.get("act") if isinstance(entry, dict) else None
+            if (isinstance(act, list) and len(act) == 4 and act[0] == _ACTIVITY_VERSION
+                    and act[1] in (-1, 0, 1)):
+                self.mode[i], self._cached_score[i], self._cached_prev[i] = act[1], act[2], act[3]
+
+    def decode(self, indices: list[int]) -> None:
+        todo = sorted({i for i in indices if i not in self.thumbs and self.mode[i] != -1})
+        if not todo:
+            return
+        if len(todo) >= 200:
+            print(f"  Decoding {len(todo):,} thumbnail(s) for activity detection...", flush=True)
+        results = decode_thumbnails([self.frames[i].path for i in todo], self.ffmpeg_bin, self.workers)
+        for i, thumb in zip(todo, results):
+            if thumb is None:
+                self.mode[i] = -1
+            else:
+                self.thumbs[i] = thumb
+                self.mode[i] = int(thumb.ir)
+        self.decoded += len(todo)
+
+    def scores(self) -> list[float]:
+        n = len(self.frames)
+        self.decode([i for i in range(n) if self.mode[i] is None])
+
+        prev = [-1] * n
+        last = {0: -1, 1: -1}
+        for i in range(n):
+            m = self.mode[i]
+            if m in (0, 1):
+                prev[i] = last[m]
+                last[m] = i
+        prev_hash = [-1 if p < 0 else _key_hash(self.frames[p].key) for p in prev]
+
+        stale = [i for i in range(n) if self.mode[i] in (0, 1)
+                 and (self._cached_score[i] is None or self._cached_prev[i] != prev_hash[i])]
+        self.decode([j for i in stale for j in (i, prev[i]) if j >= 0])
+
+        score = [float(s) if s is not None else 0.0 for s in self._cached_score]
+        normals: dict[int, list[float]] = {}
+        for i in stale:
+            score[i] = 0.0
+            p = prev[i]
+            if p < 0 or i not in self.thumbs or p not in self.thumbs:
+                continue
+            if p not in normals:
+                normals[p] = _normalized(self.thumbs[p].luma)
+            normals[i] = _normalized(self.thumbs[i].luma)
+            score[i] = _changed_fraction(normals[i], normals.pop(p))
+
+        for i, entry in enumerate(self._entries):
+            if isinstance(entry, dict) and self.mode[i] is not None:
+                entry["act"] = [_ACTIVITY_VERSION, self.mode[i], score[i], prev_hash[i]]
+        return score
+
+    def scene_change(self, before: list[int], after: list[int]) -> float:
+        """Smallest change between any frame in `before` and any in `after`."""
+        self.decode(before + after)
+        a = [_normalized(self.thumbs[i].luma) for i in before if i in self.thumbs]
+        b = [_normalized(self.thumbs[i].luma) for i in after if i in self.thumbs]
+        if not a or not b:
+            return 1.0
+        return min(_changed_fraction(x, y) for x in a for y in b)
+
+
+def centered_median(values: list[float], window: int) -> list[float]:
+    """Median over a window centred on each frame.
+
+    A median ignores a lone spike, like a hand reaching past the camera, and
+    centring the window keeps a print's start and end where they really are.
+    """
+    half = window // 2
+    return [statistics.median(values[max(0, i - half):i + half + 1]) for i in range(len(values))]
+
+
+def hysteresis_spans(signal: list[float], enter: float, leave: float) -> list[tuple[int, int]]:
+    """[start, end] index spans where the signal is on.
+
+    A span has to clear `enter` to start but only drop below `leave` to end, so
+    a score hovering at the boundary doesn't flicker on and off.
+    """
     spans: list[tuple[int, int]] = []
     start = None
-    for i, a in enumerate(active):
-        if a and start is None:
+    for i, v in enumerate(signal):
+        if start is None and v >= enter:
             start = i
-        elif not a and start is not None:
+        elif start is not None and v < leave:
             spans.append((start, i - 1))
             start = None
     if start is not None:
-        spans.append((start, len(active) - 1))
+        spans.append((start, len(signal) - 1))
+    return spans
 
-    # A pause for a layer change or a filament swap shouldn't end the video.
-    merged: list[tuple[int, int]] = []
-    for span in spans:
-        if merged:
-            gap = (frames[span[0]].ts - frames[merged[-1][1]].ts).total_seconds()
-            if gap <= min_idle_seconds:
-                merged[-1] = (merged[-1][0], span[1])
+
+def _span_edge(span: tuple[int, int], at_end: bool) -> list[int]:
+    """Up to 5 frames spread over the last (or first) ~30 frames of a span."""
+    a, b = span
+    if at_end:
+        return list(range(b, max(a, b - 30) - 1, -6))[:5]
+    return list(range(a, min(b, a + 30) + 1, 6))[:5]
+
+
+def group_prints(
+    frames: list[Frame],
+    spans: list[tuple[int, int]],
+    analyzer: ActivityAnalyzer,
+    max_pause_seconds: float,
+    min_print_seconds: float,
+) -> tuple[list[list[tuple[int, int]]], int, int]:
+    """Join active spans into prints. Returns (prints, pauses_bridged, plate_changes).
+
+    Indices in `spans` refer to `frames`, which is the full sorted frame list
+    the analyzer was built from.
+    """
+    if not spans:
+        return [], 0, 0
+    prints: list[list[tuple[int, int]]] = [[spans[0]]]
+    bridged = plate_changes = 0
+    for prev_span, span in zip(spans, spans[1:]):
+        pause = (frames[span[0]].ts - frames[prev_span[1]].ts).total_seconds()
+        if pause <= max_pause_seconds:
+            change = analyzer.scene_change(_span_edge(prev_span, True), _span_edge(span, False))
+            limit = (_SHORT_PAUSE_MAX_CHANGE if pause <= _SHORT_PAUSE_SECONDS
+                     else _LONG_PAUSE_MAX_CHANGE)
+            if change <= limit:
+                prints[-1].append(span)
+                bridged += 1
                 continue
-        merged.append(span)
+            plate_changes += 1
+        prints.append([span])
 
-    # Room lights coming on briefly move the signal too; real prints run long.
-    return [
-        (a, b) for a, b in merged
-        if (frames[b].ts - frames[a].ts).total_seconds() >= min_active_seconds
-    ]
+    def active_seconds(p: list[tuple[int, int]]) -> float:
+        # Time actually moving, not first-to-last: a few blips of glare spread
+        # over a quarter of an hour shouldn't pass for a quarter-hour print.
+        return sum((frames[b].ts - frames[a].ts).total_seconds() for a, b in p)
+
+    kept = [p for p in prints if active_seconds(p) >= min_print_seconds]
+    return kept, bridged, plate_changes
 
 
-def report_activity(frames: list[Frame], window: int) -> None:
+def report_activity(frames: list[Frame], smoothed: list[float], enter: float) -> None:
     """Print the activity score hour by hour, so thresholds can be eyeballed."""
-    if len(frames) < 2:
-        return
-    signal = activity_signal(frames, window)
     buckets: dict[datetime, list[float]] = {}
-    for frame, value in zip(frames, signal):
-        hour = frame.ts.replace(minute=0, second=0, microsecond=0)
-        buckets.setdefault(hour, []).append(value)
-
-    print("\nActivity score by hour (bar = score; compare against "
-          "--activity-enter / --activity-leave):")
+    for frame, value in zip(frames, smoothed):
+        buckets.setdefault(frame.ts.replace(minute=0, second=0, microsecond=0), []).append(value)
+    print("\nActivity by hour (score = share of the image moving; "
+          f"% = frames at or above --activity-enter {enter:g}):")
     for hour in sorted(buckets):
         values = buckets[hour]
         mean = sum(values) / len(values)
-        bar = "#" * min(50, int(mean * 1000))
-        print(f"  {hour:%Y-%m-%d %H:%M}  {len(values):4d}f  {mean:.5f}  {bar}")
+        active = sum(1 for v in values if v >= enter) / len(values)
+        bar = "#" * round(active * 40)
+        print(f"  {hour:%Y-%m-%d %H:%M}  {len(values):4d}f  score {mean:.4f}  {active:4.0%}  {bar}")
     print()
 
 
@@ -272,9 +477,9 @@ def save_timestamp_cache(cache_path: Path, cache: dict, create_dirs: bool = True
 
 def _cache_lookup(
     path: Path,
+    key: str,
     cache: dict,
-) -> tuple[datetime, str, int] | None:
-    key = str(path.resolve())
+) -> tuple[datetime, str] | None:
     entry = cache.get(key)
     if not isinstance(entry, dict):
         return None
@@ -286,20 +491,31 @@ def _cache_lookup(
         source = entry.get("source", "mtime")
         if source not in ("exif", "mtime"):
             return None
-        return ts, source, st.st_size
+        return ts, source
     except (OSError, KeyError, TypeError, ValueError):
         return None
 
 
-def _cache_store(path: Path, ts: datetime, source: str, cache: dict) -> None:
+def _cache_store(
+    path: Path,
+    key: str,
+    ts: datetime,
+    source: str,
+    cache: dict,
+    previous: dict | None = None,
+) -> None:
     try:
         st = path.stat()
-        cache[str(path.resolve())] = {
+        entry = {
             "mtime_ns": st.st_mtime_ns,
             "size": st.st_size,
             "ts_iso": ts.isoformat(sep=" "),
             "source": source,
         }
+        # Keep activity scores from a still-valid entry; they're costly to rebuild.
+        if previous is not None and "act" in previous:
+            entry["act"] = previous["act"]
+        cache[key] = entry
     except OSError:
         pass
 
@@ -323,21 +539,18 @@ def collect_timestamps(
     progress_every = max(1, total // 20)
     show_progress = total >= 200
 
-    def resolve_one(path: Path) -> tuple[datetime, str, bool, int]:
+    def resolve_one(path: Path) -> tuple[datetime, str, bool, str]:
         # Cache is read-only while workers run; fresh_cache is built on the
         # main thread once they're done.
+        key = str(path.resolve())
         if cache is not None:
-            hit = _cache_lookup(path, cache)
+            hit = _cache_lookup(path, key, cache)
             if hit is not None:
-                return hit[0], hit[1], True, hit[2]
+                return hit[0], hit[1], True, key
         ts, source = get_timestamp(path)
-        try:
-            size = path.stat().st_size
-        except OSError:
-            size = 0
-        return ts, source, False, size
+        return ts, source, False, key
 
-    results: list[tuple[datetime, str, bool, int]] = [(datetime.min, "mtime", False, 0)] * total
+    results: list[tuple[datetime, str, bool, str]] = [(datetime.min, "mtime", False, "")] * total
     done = 0
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
         futures = {pool.submit(resolve_one, p): i for i, p in enumerate(paths)}
@@ -351,14 +564,15 @@ def collect_timestamps(
     exif_count = 0
     cache_hits = 0
     fresh_cache: dict = {}
-    for path, (ts, source, from_cache, size) in zip(paths, results):
+    for path, (ts, source, from_cache, key) in zip(paths, results):
         if from_cache:
             cache_hits += 1
         if source == "exif":
             exif_count += 1
         if cache is not None:
-            _cache_store(path, ts, source, fresh_cache)
-        frames.append(Frame(path=path, ts=ts, size=size))
+            _cache_store(path, key, ts, source, fresh_cache,
+                         previous=cache.get(key) if from_cache else None)
+        frames.append(Frame(path=path, ts=ts, key=key))
 
     return frames, exif_count, cache_hits, fresh_cache
 
@@ -669,23 +883,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                     "Counted after --every-nth / --target-seconds thinning.")
 
     p.add_argument("--detect-activity", action="store_true",
-                    help="Split on when the printer is actually working instead of "
-                    "only on gaps in time. For a camera that shoots continuously, "
-                    "this is what separates prints from the idle hours between them.")
-    p.add_argument("--activity-enter", type=float, default=0.008, metavar="X",
-                    help="Activity score at which a print is considered started "
-                    "(default: 0.008). Raise if idle stretches are being kept.")
+                    help="Keep only the frames where the printer is actually working, "
+                    "one video per print. For a camera that shoots continuously, this "
+                    "is what removes the idle hours between prints. Needs ffmpeg, "
+                    "even with --dry-run.")
+    p.add_argument("--activity-enter", type=float, default=0.006, metavar="X",
+                    help="Score (share of the image moving) at which a print is "
+                    "considered started (default: 0.006). Idle scores 0.")
     p.add_argument("--activity-leave", type=float, default=0.003, metavar="X",
-                    help="Score at which an in-progress print is considered finished "
-                    "(default: 0.003). Must be below --activity-enter.")
-    p.add_argument("--activity-window", type=int, default=30, metavar="N",
-                    help="Frames to average the activity score over (default: 30).")
-    p.add_argument("--min-active-seconds", type=float, default=1800.0, metavar="S",
-                    help="Discard detected prints shorter than this (default: 1800). "
-                    "Filters out room lights and someone walking past.")
+                    help="Score below which an in-progress print is considered paused "
+                    "(default: 0.003). Must not exceed --activity-enter.")
+    p.add_argument("--activity-window", type=int, default=31, metavar="N",
+                    help="Frames to take the median score over (default: 31, about "
+                    "5 minutes at one photo per 10s).")
+    p.add_argument("--min-active-seconds", type=float, default=900.0, metavar="S",
+                    help="Discard detected prints with less than this much time "
+                    "actually moving (default: 900). Filters out someone reaching in "
+                    "to clear the bed, or a moment of glare. Lower it if you run very "
+                    "short prints.")
     p.add_argument("--min-idle-seconds", type=float, default=1800.0, metavar="S",
-                    help="Idle stretch that has to pass before a print counts as "
-                    "finished (default: 1800). Shorter pauses stay in one video.")
+                    help="Longest pause that can still be part of the same print "
+                    "(default: 1800). Pauses are cut from the video either way; this "
+                    "only decides whether what follows is a new video. Within it, "
+                    "the scene on each side decides.")
     p.add_argument("--activity-report", action="store_true",
                     help="Print the hourly activity score so the thresholds above can "
                     "be tuned to your camera. Best paired with --dry-run.")
@@ -785,15 +1005,18 @@ def main(argv: list[str] | None = None) -> int:
               "Pass --cq 23-28 to control it.", file=sys.stderr)
 
     # Check for ffmpeg up front so a missing binary fails in a second, rather
-    # than after a full scan of the card. A dry run never encodes, so skip it.
-    if not args.dry_run and resolve_ffmpeg(args.ffmpeg) is None:
+    # than after a full scan of the card. A dry run doesn't encode, but activity
+    # detection still decodes thumbnails with it.
+    needs_activity = args.detect_activity or args.activity_report
+    ffmpeg_path = resolve_ffmpeg(args.ffmpeg)
+    if (not args.dry_run or needs_activity) and ffmpeg_path is None:
         print(f"error: ffmpeg not found: {args.ffmpeg}\n"
               "  Install it and make sure it's on PATH, or point --ffmpeg at the binary.\n"
               "  Windows: winget install ffmpeg   (then restart your terminal)\n"
               "  macOS:   brew install ffmpeg\n"
               "  Linux:   sudo apt install ffmpeg\n"
               "  Already installed? Your terminal may still have the old PATH.\n"
-              "  --dry-run checks photo grouping without needing ffmpeg.",
+              "  --dry-run without --detect-activity checks grouping without ffmpeg.",
               file=sys.stderr)
         return 1
 
@@ -823,15 +1046,18 @@ def main(argv: list[str] | None = None) -> int:
     # directory iteration.
     frames.sort(key=lambda f: (f.ts, f.path))
 
-    if use_cache and cache is not None:
+    if use_cache:
+        print(f"  Cache: {cache_hits}/{len(frames)} timestamp hit(s)")
+
+    def save_cache() -> None:
+        if not use_cache:
+            return
         # A dry run must not create the output directory, so skip the write if
         # the cache's folder isn't there yet.
-        wrote = save_timestamp_cache(cache_path, fresh_cache, create_dirs=not args.dry_run)
-        if wrote:
-            print(f"  Cache: {cache_hits}/{len(frames)} hit(s); wrote {cache_path}")
+        if save_timestamp_cache(cache_path, fresh_cache, create_dirs=not args.dry_run):
+            print(f"  Wrote cache {cache_path}")
         else:
-            print(f"  Cache: {cache_hits}/{len(frames)} hit(s); not written "
-                  f"(dry run, and {cache_path.parent} doesn't exist yet)")
+            print(f"  Cache not written (dry run, and {cache_path.parent} doesn't exist yet)")
 
     print(f"  {exif_count}/{len(frames)} timestamps came from EXIF; "
           f"{len(frames) - exif_count} fell back to file modification time.")
@@ -844,30 +1070,60 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Session-split threshold: {threshold:.2f}s "
           f"({'fixed' if args.gap_seconds is not None else f'auto = median x {args.gap_multiplier}'})")
 
-    if args.activity_report:
-        report_activity(frames, args.activity_window)
+    if needs_activity:
+        print("\nScoring print activity...")
+        assert ffmpeg_path is not None
+        analyzer = ActivityAnalyzer(frames, fresh_cache if use_cache else None,
+                                    ffmpeg_path, workers)
+        raw_scores = analyzer.scores()
+        print(f"  {len(frames) - analyzer.decoded:,}/{len(frames):,} scores reused from cache; "
+              f"decoded {analyzer.decoded:,} thumbnail(s)")
+        unreadable = sum(1 for m in analyzer.mode if m == -1)
+        if unreadable:
+            print(f"  warning: ffmpeg couldn't read {unreadable:,} photo(s); they count as idle")
+
+        # Smooth and detect inside each gap-split block rather than across the
+        # whole capture: a real break in the capture is still a break.
+        smoothed: list[float] = []
+        block_spans: list[list[tuple[int, int]]] = []
+        offset = 0
+        for s in sessions:
+            block = centered_median(raw_scores[offset:offset + s.n], args.activity_window)
+            smoothed += block
+            block_spans.append([(offset + a, offset + b) for a, b in
+                                hysteresis_spans(block, args.activity_enter, args.activity_leave)])
+            offset += s.n
+
+        if args.activity_report:
+            report_activity(frames, smoothed, args.activity_enter)
 
     if args.detect_activity:
-        # Runs inside the gap-split sessions, not instead of them: a real break
-        # in the capture is still a break, and carving each one into active
-        # spans is what separates prints on a camera that never stops.
-        before_n = sum(s.n for s in sessions)
-        carved: list[Session] = []
-        for s in sessions:
-            sig = activity_signal(s.frames, args.activity_window)
-            for a, b in find_active_spans(s.frames, sig, args.activity_enter,
-                                          args.activity_leave, args.min_active_seconds,
-                                          args.min_idle_seconds):
-                carved.append(Session(frames=s.frames[a:b + 1]))
-        after_n = sum(s.n for s in carved)
+        before_n = len(frames)
+        found: list[Session] = []
+        bridged = plate_changes = 0
+        for spans in block_spans:
+            prints, b, c = group_prints(frames, spans, analyzer,
+                                        args.min_idle_seconds, args.min_active_seconds)
+            bridged += b
+            plate_changes += c
+            for spans_in_print in prints:
+                # Only the active spans go into the video; the motionless pauses
+                # between them are cut, so no idle footage survives either way.
+                found.append(Session(frames=[f for a, b2 in spans_in_print
+                                             for f in frames[a:b2 + 1]]))
+        after_n = sum(s.n for s in found)
         idle_dropped = before_n - after_n
-        print(f"Activity detection: {len(carved)} print(s) found in "
-              f"{len(sessions)} capture block(s); dropped {idle_dropped:,} idle "
-              f"frames ({idle_dropped / before_n:.1%} of the capture)")
-        if not carved:
+        print(f"Activity detection: {len(found)} print(s) in {len(sessions)} capture "
+              f"block(s); kept {after_n:,} frames, cut {idle_dropped:,} idle "
+              f"({idle_dropped / before_n:.1%})")
+        print(f"  Joined {bridged} pause(s) back into their print; split at "
+              f"{plate_changes} short gap(s) where the plate had changed")
+        if not found:
             print("  Nothing cleared the activity thresholds. Re-run with "
-                  "--activity-report to see the signal, then lower --activity-enter.")
-        sessions = carved
+                  "--activity-report to see the scores, then lower --activity-enter.")
+        sessions = found
+
+    save_cache()
 
     # Thin after splitting, never before: the gap detection above needs every
     # timestamp to find the real breaks between prints.
